@@ -1,13 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from curl_cffi import requests
-from bs4 import BeautifulSoup
+import urllib.request
+import ssl
 import re
+from bs4 import BeautifulSoup
 
 app = FastAPI(title="XamToppr Rank Engine")
 
-# CORS allow taaki aapka frontend bina kisi rukawat ke request bhej sake
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,36 +27,48 @@ def root():
 
 @app.post("/api/calculate")
 def calculate_score(data: ScoreRequest):
-    url = data.url.strip()
-    if not url.startswith("http"):
+    raw_url = data.url.strip()
+    if not raw_url.startswith("http"):
         raise HTTPException(status_code=400, detail="Invalid DigiALM URL")
 
-    # Step 1: Chrome TLS Impersonation (Bypasses DigiALM / Cloudflare Firewall)
+    # Raw fetch preserving exact double slashes (Fixes 400 Bad Request)
+    html_content = ""
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
-        }
-        res = requests.get(url, impersonate="chrome120", headers=headers, timeout=12)
-        if res.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"DigiALM returned status {res.status_code}")
-        html_content = res.text
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        req = urllib.request.Request(
+            raw_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9,hi;q=0.8"
+            }
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as response:
+            html_content = response.read().decode("utf-8", errors="ignore")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch response sheet: {str(e)}")
+        # Fallback via curl_cffi
+        try:
+            from curl_cffi import requests
+            res = requests.get(raw_url, impersonate="chrome120", timeout=15)
+            html_content = res.text
+        except Exception as e2:
+            raise HTTPException(status_code=400, detail=f"Failed to load response sheet from DigiALM ({str(e)})")
 
-    # Step 2: Parse Candidate Details & Questions
+    if not html_content or len(html_content) < 500:
+        raise HTTPException(status_code=400, detail="Empty response received from DigiALM server.")
+
+    # Parsing Logic
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # Extract Candidate Info
     cand_name = "Candidate"
     roll_number = "N/A"
     exam_name = "RRB / SSC Online Exam"
     exam_date = ""
-    exam_time = ""
 
     for tr in soup.find_all("tr"):
-        text = tr.get_text()
         cells = tr.find_all("td")
         if len(cells) >= 2:
             key = cells[0].get_text().strip()
@@ -64,14 +76,11 @@ def calculate_score(data: ScoreRequest):
             if "Candidate Name" in key: cand_name = val
             elif "Roll Number" in key or "Participant ID" in key: roll_number = val
             elif "Subject" in key or "Exam Name" in key: exam_name = val
-            elif "Test Date" in key: exam_date = val
-            elif "Test Time" in key: exam_time = val
+            elif "Test Date" in key or "Test Time" in key: exam_date += (" " + val)
 
-    # Extract Question Panels
     panels = soup.find_all(lambda tag: tag.name == "div" and ("question-pnl" in tag.get("class", []) or "grp-cnt" in tag.get("class", [])))
     if not panels:
         panels = soup.find_all("table", class_="menu-tbl")
-        # Fallback wrapper
         panels = [tbl.find_parent("div") for tbl in panels if tbl.find_parent("div")]
 
     questions = []
@@ -88,19 +97,15 @@ def calculate_score(data: ScoreRequest):
         if menu_tbl:
             menu_text = menu_tbl.get_text()
             m = re.search(r"Chosen Option\s*:\s*([1-4]|--)", menu_text)
-            if m:
-                chosen_opt = m.group(1)
+            if m: chosen_opt = m.group(1)
 
-        # Official Key (Green tick class rightAns)
         correct_opt = "1"
         right_td = panel.find(class_=re.compile(r"rightAns|correct"))
         if right_td:
             txt = right_td.get_text().strip()
             num_m = re.search(r"^([1-4])\.", txt)
-            if num_m:
-                correct_opt = num_m.group(1)
+            if num_m: correct_opt = num_m.group(1)
 
-        # Status Check
         if chosen_opt == "--" or not chosen_opt:
             status = "UNATTEMPTED"
             unatt_cnt += 1
@@ -119,7 +124,6 @@ def calculate_score(data: ScoreRequest):
         elif status == "WRONG": sections[sec_name]["wrong"] += 1
         else: sections[sec_name]["unattempted"] += 1
 
-        # Extract Question Text
         stem_el = panel.find(class_=re.compile(r"qtext|question-text|bold"))
         stem_text = stem_el.get_text().strip() if stem_el else f"Question #{q_no}"
 
@@ -145,8 +149,7 @@ def calculate_score(data: ScoreRequest):
             "name": cand_name,
             "rollNumber": roll_number,
             "examName": exam_name,
-            "examDate": exam_date,
-            "examTime": exam_time,
+            "examDate": exam_date.strip() or "Official Shift",
             "category": data.category,
             "zone": data.zone
         },
