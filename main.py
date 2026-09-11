@@ -1,9 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from curl_cffi import requests
-from bs4 import BeautifulSoup
+import urllib.request
+import ssl
 import re
+from bs4 import BeautifulSoup
+from curl_cffi import requests as cffi_requests
 
 app = FastAPI(title="XamToppr Rank Engine")
 
@@ -22,7 +24,52 @@ class ScoreRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "online", "engine": "XamToppr DigiALM Universal Scraper"}
+    return {"status": "online", "engine": "XamToppr DigiALM Ultra Scraper"}
+
+def clean_digialm_url(raw_url: str) -> str:
+    url = raw_url.strip()
+    # Protocol preserve karke path ke duplicate slashes clean karna
+    if "://" in url:
+        proto, path = url.split("://", 1)
+        clean_path = re.sub(r"/+", "/", path)
+        return f"{proto}://{clean_path}"
+    return url
+
+def fetch_html_content(target_url: str) -> str:
+    cleaned_url = clean_digialm_url(target_url)
+    urls_to_try = [cleaned_url, target_url.strip()]
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+        "Connection": "keep-alive"
+    }
+
+    # Method 1: Standard Python urllib (Double slash resilient)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    for u in urls_to_try:
+        try:
+            req = urllib.request.Request(u, headers=headers)
+            with urllib.request.urlopen(req, timeout=12, context=ctx) as response:
+                if response.status == 200:
+                    return response.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+
+    # Method 2: curl_cffi Impersonate Chrome
+    for u in urls_to_try:
+        try:
+            res = cffi_requests.get(u, impersonate="chrome120", headers=headers, timeout=12, verify=False)
+            if res.status_code == 200 and len(res.text) > 500:
+                return res.text
+        except Exception:
+            pass
+
+    raise Exception("DigiALM URL is unreachable or expired.")
 
 @app.post("/api/calculate")
 def calculate_score(data: ScoreRequest):
@@ -30,23 +77,13 @@ def calculate_score(data: ScoreRequest):
     if not url.startswith("http"):
         raise HTTPException(status_code=400, detail="Invalid URL format")
 
-    # Step 1: Chrome Impersonation
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
-    }
     try:
-        res = requests.get(url, impersonate="chrome120", headers=headers, timeout=15)
-        if res.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"DigiALM HTTP {res.status_code}")
-        html_content = res.text
+        html_content = fetch_html_content(url)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Scraper error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # Step 2: Extract Candidate Details
     cand_name = "Candidate"
     roll_number = "N/A"
     exam_name = "Railway / SSC Online Exam"
@@ -54,7 +91,6 @@ def calculate_score(data: ScoreRequest):
     exam_time = ""
 
     for tr in soup.find_all("tr"):
-        row_text = tr.get_text()
         cells = tr.find_all("td")
         if len(cells) >= 2:
             k = cells[0].get_text().strip()
@@ -65,7 +101,6 @@ def calculate_score(data: ScoreRequest):
             elif "Test Date" in k and v: exam_date = v
             elif "Test Time" in k and v: exam_time = v
 
-    # Step 3: Universal DigiALM Question Extraction
     menu_tables = soup.find_all("table", class_=re.compile(r"menu-tbl|menu_tbl", re.I))
     
     questions = []
@@ -77,19 +112,14 @@ def calculate_score(data: ScoreRequest):
     for idx, m_tbl in enumerate(menu_tables):
         q_no = idx + 1
         
-        # Chosen Option
         chosen_opt = "--"
         tbl_text = m_tbl.get_text()
         m_chosen = re.search(r"Chosen Option\s*:\s*([1-4]|--)", tbl_text, re.I)
         if m_chosen:
             chosen_opt = m_chosen.group(1).strip()
 
-        # Find enclosing question block/parent
-        parent = m_tbl.find_parent("table") or m_tbl.find_parent("div")
-        if not parent:
-            parent = m_tbl
+        parent = m_tbl.find_parent("table") or m_tbl.find_parent("div") or m_tbl
 
-        # Official Key Detection
         correct_opt = "1"
         right_elem = parent.find(class_=re.compile(r"rightAns|correct|bold", re.I))
         if right_elem:
@@ -102,7 +132,6 @@ def calculate_score(data: ScoreRequest):
                 if td_right:
                     correct_opt = td_right.get_text().strip()[:1]
 
-        # Status
         if chosen_opt in ["--", "", None]:
             status = "UNATTEMPTED"
             unatt_cnt += 1
@@ -113,7 +142,6 @@ def calculate_score(data: ScoreRequest):
             status = "WRONG"
             wrong_cnt += 1
 
-        # Section Grouping
         sec_name = "General Science" if q_no <= 25 else "Mathematics" if q_no <= 55 else "General Intelligence & Reasoning" if q_no <= 85 else "General Awareness"
         if sec_name not in sections:
             sections[sec_name] = {"total": 0, "correct": 0, "wrong": 0, "unattempted": 0}
@@ -122,9 +150,8 @@ def calculate_score(data: ScoreRequest):
         elif status == "WRONG": sections[sec_name]["wrong"] += 1
         else: sections[sec_name]["unattempted"] += 1
 
-        # Question Text
         q_text_el = parent.find(class_=re.compile(r"qtext|question-text", re.I))
-        q_text = q_text_el.get_text().strip() if q_text_el else f"Official Question Item #{q_no}"
+        q_text = q_text_el.get_text().strip() if q_text_el else f"Official Question #{q_no}"
 
         questions.append({
             "qNo": q_no,
@@ -141,7 +168,6 @@ def calculate_score(data: ScoreRequest):
             ]
         })
 
-    # Marks Calculation (+1, -0.33)
     raw_score = round(correct_cnt * 1.0 - wrong_cnt * 0.33, 2)
     display_date = f"{exam_date} ({exam_time})" if exam_time else exam_date
 
